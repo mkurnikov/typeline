@@ -1,0 +1,10 @@
+version: '2'
+services:
+  postgres:
+    build: ./files
+    volumes:
+      - ./pg_data:/pg/data
+    ports:
+      - "5432:5432"
+    environment:
+      - PGDATA=/pg/data

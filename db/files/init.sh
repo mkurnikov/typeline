@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -e
+
+POSTGRES_USER=$POSTGRES_USER
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<-EOSQL
+    ALTER USER postgres WITH ENCRYPTED PASSWORD 'postgres';
+    CREATE DATABASE traces;
+EOSQL
+
