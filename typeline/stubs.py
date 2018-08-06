@@ -1,0 +1,754 @@
+# Copyright (c) 2017-present, Facebook, Inc.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+import asyncio
+import collections
+import enum
+import inspect
+import logging
+import parser
+import re
+import sys
+from abc import (
+    ABCMeta,
+    abstractmethod,
+)
+from typing import (  # type: ignore
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterable,
+    GenericMeta,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    _Any,
+    _Union,
+    List)
+
+try:
+    from django.utils.functional import cached_property  # type: ignore
+except ImportError:
+    cached_property = None
+
+from typeline.tracing import (
+    CallTrace,
+    CallTraceLogger,
+    ClassPropsTrace)
+from typeline.typing import (
+    NoneType,
+    NoOpRewriter,
+    TypeRewriter,
+    make_generator,
+    make_iterator,
+    shrink_types,
+)
+from typeline.util import get_name_in_module
+
+
+logger = logging.getLogger(__name__)
+
+
+class FunctionKind(enum.Enum):
+    MODULE = 0
+    CLASS = 1
+    INSTANCE = 2
+    STATIC = 3
+    # Properties are really instance methods, but this is fine for now...
+    PROPERTY = 4
+    DJANGO_CACHED_PROPERTY = 5
+
+    @classmethod
+    def from_callable(cls, func: Callable) -> 'FunctionKind':
+        if '.' not in func.__qualname__:
+            return FunctionKind.MODULE
+        func_or_desc = get_name_in_module(func.__module__, func.__qualname__, inspect.getattr_static)
+        if isinstance(func_or_desc, classmethod):
+            return FunctionKind.CLASS
+        elif isinstance(func_or_desc, staticmethod):
+            return FunctionKind.STATIC
+        elif isinstance(func_or_desc, property):
+            return FunctionKind.PROPERTY
+        elif cached_property and isinstance(func_or_desc, cached_property):
+            return FunctionKind.DJANGO_CACHED_PROPERTY
+        return FunctionKind.INSTANCE
+
+
+class FunctionDefinition:
+    _KIND_WITH_SELF = {
+        FunctionKind.CLASS,
+        FunctionKind.INSTANCE,
+        FunctionKind.PROPERTY,
+        FunctionKind.DJANGO_CACHED_PROPERTY,
+    }
+
+    def __init__(
+            self,
+            module: str,
+            qualname: str,
+            kind: FunctionKind,
+            sig: inspect.Signature,
+            is_async: bool = False
+    ) -> None:
+        self.module = module
+        self.qualname = qualname
+        self.kind = kind
+        self.signature = sig
+        self.is_async = is_async
+
+    @classmethod
+    def from_callable(cls, func: Callable, kind: FunctionKind = None) -> 'FunctionDefinition':
+        kind = FunctionKind.from_callable(func)
+        sig = inspect.Signature.from_callable(func)
+        is_async = asyncio.iscoroutinefunction(func)
+        return FunctionDefinition(func.__module__, func.__qualname__, kind, sig, is_async)
+
+    @property
+    def has_self(self) -> bool:
+        return self.kind in self._KIND_WITH_SELF
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, self.__class__):
+            return self.__dict__ == other.__dict__
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return "FunctionDefinition('%s', '%s', %s, %s, %s)" % (
+            self.module, self.qualname, self.kind, self.signature, self.is_async)
+
+
+class ImportMap(collections.defaultdict):
+    """A mapping of module name to the set of names to be imported."""
+
+    def __init__(self) -> None:
+        super().__init__(set)
+
+    def merge(self, other: 'ImportMap') -> None:
+        for module, names in other.items():
+            self[module].update(names)
+
+
+def _get_import_for_qualname(qualname: str) -> str:
+    # Nested classes are annotated using the path from the root class
+    # (e.g. Parent.Child, where Child is defined inside Parent)
+    return qualname.split('.')[0]
+
+
+def get_imports_for_annotation(anno: Any) -> ImportMap:
+    """Return the imports (module, name) needed for the type in the annotation"""
+    imports = ImportMap()
+    if (
+            anno is inspect.Parameter.empty or
+            anno is inspect.Signature.empty or
+            not isinstance(anno, (type, _Any, _Union)) or
+            anno.__module__ == 'builtins'
+    ):
+        return imports
+    if isinstance(anno, _Any):
+        imports['typing'].add('Any')
+    elif _is_optional(anno):
+        imports['typing'].add('Optional')
+        elem_type = _get_optional_elem(anno)
+        elem_imports = get_imports_for_annotation(elem_type)
+        imports.merge(elem_imports)
+    elif isinstance(anno, (_Union, GenericMeta)):
+        if isinstance(anno, _Union):
+            imports['typing'].add('Union')
+        else:
+            name = _get_import_for_qualname(anno.__qualname__)
+            imports[anno.__module__].add(name)
+        elem_types = anno.__args__ or []
+        for et in elem_types:
+            elem_imports = get_imports_for_annotation(et)
+            imports.merge(elem_imports)
+    else:
+        name = _get_import_for_qualname(anno.__qualname__)
+        imports[anno.__module__].add(name)
+    return imports
+
+
+def get_imports_for_signature(sig: inspect.Signature) -> ImportMap:
+    """Return the imports (module, name) needed for all types in annotations"""
+    imports = ImportMap()
+    for param in sig.parameters.values():
+        param_imports = get_imports_for_annotation(param.annotation)
+        imports.merge(param_imports)
+    return_imports = get_imports_for_annotation(sig.return_annotation)
+    imports.merge(return_imports)
+    return imports
+
+
+def get_imports_for_types(types: List[type]):
+    imports = ImportMap()
+    for typ in types:
+        anno_imports = get_imports_for_annotation(typ)
+        imports.merge(anno_imports)
+
+    return imports
+
+
+def update_signature_args(
+        sig: inspect.Signature,
+        arg_types: Dict[str, type],
+        has_self: bool,
+        ignore_existing_annotations: bool = False) -> inspect.Signature:
+    """Update argument annotations with the supplied types"""
+    params = []
+    for arg_idx, name in enumerate(sig.parameters):
+        param = sig.parameters[name]
+        typ = arg_types.get(name)
+        typ = inspect.Parameter.empty if typ is None else typ
+        is_self = (has_self and arg_idx == 0)
+        annotated = param.annotation is not inspect.Parameter.empty
+        # Don't touch existing annotations unless ignore_existing_annotations
+        if not is_self and (ignore_existing_annotations or not annotated):
+            param = param.replace(annotation=typ)
+        params.append(param)
+    return sig.replace(parameters=params)
+
+
+def update_signature_return(
+        sig: inspect.Signature,
+        return_type: type = None,
+        yield_type: type = None,
+        ignore_existing_annotations: bool = False) -> inspect.Signature:
+    """Update return annotation with the supplied types"""
+    anno = sig.return_annotation
+    # Don't touch pre-existing annotations unless ignore_existing_annotations
+    if not ignore_existing_annotations and anno is not inspect.Signature.empty:
+        return sig
+    # NB: We cannot distinguish between functions that explicitly only
+    # return None and those that do so implicitly. In the case of generator
+    # functions both are typed as Iterator[<yield_type>]
+    if (yield_type is not None) and ((return_type is None) or (return_type == NoneType)):
+        anno = make_iterator(yield_type)
+    elif (yield_type is not None) and (return_type is not None):
+        anno = make_generator(yield_type, NoneType, return_type)
+    elif return_type is not None:
+        anno = return_type
+    return sig.replace(return_annotation=anno)
+
+
+def shrink_traced_types(traces: Iterable[CallTrace]) -> Tuple[Dict[str, type], Optional[type], Optional[type]]:
+    """Merges the traced types and returns the minimally equivalent types"""
+    arg_types: DefaultDict[str, Set[type]] = collections.defaultdict(set)
+    return_types: Set[type] = set()
+    yield_types: Set[type] = set()
+
+    for t in traces:
+        for arg, typ in t.arg_types.items():
+            arg_types[arg].add(typ)
+        if t.return_type is not None:
+            return_types.add(t.return_type)
+        if t.yield_type is not None:
+            yield_types.add(t.yield_type)
+
+    shrunken_arg_types = {name: shrink_types(ts) for name, ts in arg_types.items()}
+    return_type = shrink_types(return_types) if return_types else None
+    yield_type = shrink_types(yield_types) if yield_types else None
+    return shrunken_arg_types, return_type, yield_type
+
+
+def get_updated_definition(
+        func: Callable,
+        traces: Iterable[CallTrace],
+        rewriter: Optional[TypeRewriter] = None,
+        ignore_existing_annotations: bool = False,
+) -> FunctionDefinition:
+    """Update the definition for func using the types collected in traces."""
+    if rewriter is None:
+        rewriter = NoOpRewriter()
+    defn = FunctionDefinition.from_callable(func)
+
+    arg_types, return_type, yield_type = shrink_traced_types(traces)
+    arg_types = {name: rewriter.rewrite(typ) for name, typ in arg_types.items()}
+
+    if return_type is not None:
+        return_type = rewriter.rewrite(return_type)
+    else:
+        return_type = Any
+
+    if yield_type is not None:
+        yield_type = rewriter.rewrite(yield_type)
+
+    sig = defn.signature
+    # TODO: add type of default to signature of parameter
+    sig = update_signature_args(sig, arg_types, defn.has_self, ignore_existing_annotations)
+    sig = update_signature_return(sig, return_type, yield_type, ignore_existing_annotations)
+    return FunctionDefinition(defn.module, defn.qualname, defn.kind, sig, defn.is_async)
+
+
+class Stub(metaclass=ABCMeta):
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, self.__class__):
+            return self.__dict__ == other.__dict__
+        return NotImplemented
+
+    @abstractmethod
+    def render(self) -> str:
+        pass
+
+
+class ImportBlockStub(Stub):
+    def __init__(self, imports: ImportMap = None) -> None:
+        self.imports = imports if imports else ImportMap()
+
+    def render(self) -> str:
+        imports = []
+        for module in sorted(self.imports.keys()):
+            names = sorted(self.imports[module])
+            if module == '_io':
+                module = module[1:]
+            if len(names) == 1:
+                imports.append("from %s import %s" % (module, names[0]))
+            else:
+                stanza = ["from %s import (" % (module,)]
+                stanza.extend(["    %s," % (name,) for name in names])
+                stanza.append(")")
+                imports.append("\n".join(stanza))
+        return "\n".join(imports)
+
+    def __repr__(self) -> str:
+        return 'ImportBlockStub(%s)' % (repr(self.imports),)
+
+
+def has_unparsable_defaults(sig: inspect.Signature) -> bool:
+    """Return whether or not the reprs for all defaults in the signature are valid python expressions"""
+    for param in sig.parameters.values():
+        if param.default is inspect.Parameter.empty:
+            continue
+        try:
+            parser.expr(repr(param.default))
+        except SyntaxError:
+            return True
+    return False
+
+
+def _is_optional(anno: Any) -> bool:
+    """Is the supplied annotation an instance of the 'virtual' Optional type?
+
+    Optional isn't really a type. It's an alias to Union[T, NoneType]
+    """
+    if not isinstance(anno, _Union):
+        return False
+
+    optional = NoneType in anno.__args__
+    return optional
+
+
+def _get_optional_elem(anno: Any) -> Any:
+    """Get the non-null type from an optional."""
+    if not _is_optional(anno):
+        raise TypeError("Supplied annotation isn't an optional")
+    elems = tuple(e for e in anno.__args__ if (e is not NoneType))
+    if len(elems) == 1:
+        return elems[0]
+    return Union[elems]
+
+
+def render_generic(anno) -> str:
+    cls_name = anno.__name__
+    rendered_args = [render_annotation(arg) for arg in anno.__args__ or []]
+    if not rendered_args:
+        return cls_name
+
+    return cls_name + '[' + ', '.join(rendered_args) + ']'
+
+
+def safe_issubclass(t, base):
+    try:
+        return issubclass(t, base)
+    except TypeError:
+        return False
+
+
+def render_annotation(anno: Any) -> str:
+    """Convert an annotation into its stub representation."""
+    if _is_optional(anno):
+        elem_type = _get_optional_elem(anno)
+        rendered = 'Optional[' + render_annotation(elem_type) + ']'
+    elif hasattr(anno, '_gorg'):
+        rendered = render_generic(anno)
+    elif hasattr(anno, '__supertype__'):
+        rendered = anno.__name__
+    elif getattr(anno, '__module__', None) == 'typing':
+        rendered = repr(anno).replace('typing.', '')
+    elif isinstance(anno, NoneType):
+        rendered = 'None'
+    elif isinstance(anno, type):
+        if anno.__module__ in ('builtins',):
+            rendered = anno.__qualname__
+        else:
+            rendered = anno.__module__ + '.' + anno.__qualname__
+    else:
+        rendered = repr(anno)
+
+    # Temporary hacky workaround for #76 to fix remaining NoneType hints by search-replace
+    return rendered.replace('NoneType', 'None')
+
+
+def render_parameter(param: inspect.Parameter) -> str:
+    """Convert a parameter into its stub representation.
+
+    NB: This is copied almost entirely from https://github.com/python/cpython/blob/3.6/Lib/inspect.py
+    with the modification that it calls our own rendering functions for annotations.
+
+    TODO: push a patch upstream so we don't have to do this on Python 3.x.
+    """
+    kind = param.kind
+    formatted = param.name
+
+    # Add annotation and default value
+    if param.annotation is not inspect.Parameter.empty:
+        anno = param.annotation
+        if not _is_optional(anno) and param.default is None:
+            # we're constructing types at runtime and mypy is very confused
+            anno = Optional[anno]  # type: ignore
+        rendered = render_annotation(anno)
+        formatted = '{}: {}'.format(formatted, rendered)
+
+    if param.default is not inspect.Parameter.empty:
+        formatted = '{} = {}'.format(formatted, repr(param.default))
+
+    if kind == inspect.Parameter.VAR_POSITIONAL:
+        formatted = '*' + formatted
+    elif kind == inspect.Parameter.VAR_KEYWORD:
+        formatted = '**' + formatted
+
+    return formatted
+
+
+def render_signature(
+        sig: inspect.Signature,
+        max_line_len: Optional[int] = None,
+        prefix: str = ''
+) -> str:
+    """Convert a signature into its stub representation.
+
+    NB: This is copied almost entirely from https://github.com/python/cpython/blob/3.6/Lib/inspect.py
+    with the modification that it calls our own rendering functions for annotations.
+
+    TODO: push a patch upstream so we don't have to do this on Python 3.x.
+    """
+    formatted_params = []
+    render_pos_only_separator = False
+    render_kw_only_separator = True
+    for param in sig.parameters.values():
+        formatted = render_parameter(param)
+        kind = param.kind
+
+        if kind == inspect.Parameter.POSITIONAL_ONLY:
+            render_pos_only_separator = True
+        elif render_pos_only_separator:
+            # It's not a positional-only parameter, and the flag
+            # is set to 'True' (there were pos-only params before.)
+            formatted_params.append('/')
+            render_pos_only_separator = False
+
+        if kind == inspect.Parameter.VAR_POSITIONAL:
+            # OK, we have an '*args'-like parameter, so we won't need
+            # a '*' to separate keyword-only arguments
+            render_kw_only_separator = False
+        elif kind == inspect.Parameter.KEYWORD_ONLY and render_kw_only_separator:
+            # We have a keyword-only parameter to render and we haven't
+            # rendered an '*args'-like parameter before, so add a '*'
+            # separator to the parameters list ("foo(arg1, *, arg2)" case)
+            formatted_params.append('*')
+            # This condition should be only triggered once, so
+            # reset the flag
+            render_kw_only_separator = False
+
+        formatted_params.append(formatted)
+
+        if render_pos_only_separator:
+            # There were only positional-only parameters, hence the
+            # flag was not reset to 'False'
+            formatted_params.append('/')
+
+    rendered_return = ''
+    if sig.return_annotation is not inspect.Signature.empty:
+        anno = render_annotation(sig.return_annotation)
+        rendered_return = ' -> {}'.format(anno)
+
+    # first try render it into one single line, if it doesn't exceed
+    # the limit then just use it
+    rendered_single_line = '({})'.format(', '.join(formatted_params)) + rendered_return
+    if max_line_len is None or len(rendered_single_line) <= max_line_len:
+        return rendered_single_line
+
+    # add prefix to all lines except the first one
+    rendered_multi_lines = ['(']
+    for i, f_param in enumerate(formatted_params):
+        line = '    ' + f_param
+        if i != len(formatted_params) - 1:
+            line += ','
+        rendered_multi_lines.append(prefix + line)
+    rendered_multi_lines.append(prefix + ')' + rendered_return)
+    return '\n'.join(rendered_multi_lines)
+
+
+class FunctionStub(Stub):
+    def __init__(
+            self,
+            name: str,
+            signature: inspect.Signature,
+            kind: FunctionKind,
+            strip_modules: Iterable[str] = None,
+            is_async: bool = False
+    ) -> None:
+        self.name = name
+        self.signature = signature
+        self.kind = kind
+        self.strip_modules = strip_modules or []
+        self.is_async = is_async
+
+    def render(self, prefix: str = '') -> str:
+        s = prefix
+        if self.is_async:
+            s += 'async '
+        s += 'def ' + self.name
+        s += render_signature(self.signature, 120 - len(s), prefix) + ': ...'
+        # Yes, this is a horrible hack, but inspect.py gives us no way to
+        # specify the function that should be used to format annotations.
+        for module in self.strip_modules:
+            s = s.replace(module + '.', '')
+        if self.kind == FunctionKind.CLASS:
+            s = prefix + "@classmethod\n" + s
+        elif self.kind == FunctionKind.STATIC:
+            s = prefix + "@staticmethod\n" + s
+        elif self.kind == FunctionKind.PROPERTY:
+            s = prefix + "@property\n" + s
+        elif self.kind == FunctionKind.DJANGO_CACHED_PROPERTY:
+            s = prefix + "@cached_property\n" + s
+        return s
+
+    def __repr__(self) -> str:
+        return 'FunctionStub(%s, %s, %s, %s, %s)' % (
+            repr(self.name), repr(self.signature), repr(self.kind), repr(self.strip_modules), self.is_async)
+
+
+class ClassPropertyStub(Stub):
+    def __init__(self,
+                 name: str,
+                 typ: type):
+        self.name = name
+        self.typ = typ
+
+    def render(self, prefix: str = '') -> str:
+        s = prefix
+        s += self.name
+        s += ': '
+        s += render_annotation(self.typ)
+        return s
+
+
+class ClassStub(Stub):
+    def __init__(self, name: str, function_stubs: Iterable[FunctionStub] = None,
+                 property_stubs: Iterable[ClassPropertyStub] = None) -> None:
+        self.name = name
+        self.function_stubs: Dict[str, FunctionStub] = {}
+        self.property_stubs = {}
+        if function_stubs is not None:
+            self.function_stubs = {stub.name: stub for stub in function_stubs}
+        if property_stubs is not None:
+            self.property_stubs = {stub.name: stub for stub in property_stubs}
+
+    def render(self) -> str:
+        parts = ['class %s:' % (self.name,)]
+        with_properties = False
+        for name in sorted(list(self.property_stubs)):
+            stub = self.property_stubs[name]
+            parts.append(stub.render(prefix='    '))
+            with_properties = True
+
+        if with_properties:
+            parts.append('')
+
+        for name in sorted(self.function_stubs):
+            stub = self.function_stubs[name]
+            parts.append(stub.render(prefix='    '))
+        return "\n".join(parts)
+
+    def __repr__(self) -> str:
+        return 'ClassStub(%s, %s)' % (repr(self.name), tuple(self.function_stubs.values()))
+
+
+class ModuleStub(Stub):
+    def __init__(
+            self,
+            function_stubs: Iterable[FunctionStub] = None,
+            class_stubs: Iterable[ClassStub] = None,
+            imports_stub: ImportBlockStub = None
+    ) -> None:
+        self.function_stubs: Dict[str, FunctionStub] = {}
+        if function_stubs is not None:
+            self.function_stubs = {stub.name: stub for stub in function_stubs}
+        self.class_stubs: Dict[str, ClassStub] = {}
+        if class_stubs is not None:
+            self.class_stubs = {stub.name: stub for stub in class_stubs}
+        self.imports_stub = imports_stub if imports_stub else ImportBlockStub()
+
+    def render(self) -> str:
+        parts = []
+        if self.imports_stub.imports:
+            parts.append(self.imports_stub.render())
+        for func_stub in sorted(self.function_stubs.values(), key=lambda s: s.name):
+            parts.append(func_stub.render())
+        for class_stub in sorted(self.class_stubs.values(), key=lambda s: s.name):
+            parts.append(class_stub.render())
+        return "\n\n\n".join(parts)
+
+    def __repr__(self) -> str:
+        return 'ModuleStub(%s, %s, %s)' % (
+            tuple(self.function_stubs.values()), tuple(self.class_stubs.values()), repr(self.imports_stub))
+
+
+def build_module_stubs(entries: Iterable[FunctionDefinition],
+                       class_properties: Optional[Dict[str, Dict[str, type]]]) -> Dict[str, ModuleStub]:
+    """Given an iterable of function definitions, build the corresponding stubs"""
+    mod_stubs: Dict[str, ModuleStub] = {}
+    for entry in entries:
+        path = entry.qualname.split('.')
+        name = path.pop()
+
+        # TODO: Handle nested classes
+        klass = None
+        if len(path) > 0:
+            klass = '.'.join(path)
+        if entry.module not in mod_stubs:
+            mod_stubs[entry.module] = ModuleStub()
+
+        mod_stub = mod_stubs[entry.module]
+        imports = get_imports_for_signature(entry.signature)
+        func_stub = FunctionStub(name, entry.signature, entry.kind, list(imports.keys()), entry.is_async)
+        # Don't need to import anything from the same module
+        imports.pop(entry.module, None)
+        mod_stub.imports_stub.imports.merge(imports)
+        if klass is not None:
+            if klass not in mod_stub.class_stubs:
+                mod_stub.class_stubs[klass] = ClassStub(klass)
+            class_stub = mod_stub.class_stubs[klass]
+            class_stub.function_stubs[func_stub.name] = func_stub
+        else:
+            mod_stub.function_stubs[func_stub.name] = func_stub
+
+    if class_properties:
+        for klass, props in class_properties.items():
+            module, qualname = klass.rsplit('.', maxsplit=1)
+
+            try:
+                module_stub = mod_stubs[module]
+            except KeyError:
+                continue
+
+            if qualname not in module_stub.class_stubs:
+                module_stub.class_stubs[qualname] = ClassStub(qualname)
+
+            class_stub = module_stub.class_stubs[qualname]
+
+            types = []
+            for name, typ in props.items():
+                class_stub.property_stubs[name] = ClassPropertyStub(name, typ)
+                types.append(typ)
+
+            imports.merge(get_imports_for_types(types))
+
+    return mod_stubs
+
+
+def extract_public_properties(trace: dict):
+    public_props = {}
+    for key, val in trace.items():
+        if not key.startswith('_'):
+            public_props[key] = val
+
+    return public_props
+
+
+def build_module_stubs_from_traces(
+        traces: Iterable[CallTrace],
+        class_traces: Iterable[ClassPropsTrace],
+        ignore_existing_annotations: bool = False,
+        rewriter: Optional[TypeRewriter] = None
+) -> Dict[str, ModuleStub]:
+    """Given an iterable of call traces, build the corresponding stubs."""
+    index: DefaultDict[Callable, Set[CallTrace]] = collections.defaultdict(set)
+
+    for trace in traces:
+        index[trace.func].add(trace)
+        # if trace.obj_dict:
+        #     full_class_name = trace.arg_types['self'].__module__ + '.' + trace.arg_types['self'].__name__
+        #     if len(classes[full_class_name]) > 10:
+        #         continue
+        #
+        #     public_object_properties = extract_public_properties(trace)
+        #     if public_object_properties:
+        #         trace.obj_dict = public_object_properties
+        #         full_class_name = trace.arg_types['self'].__module__ + '.' + trace.arg_types['self'].__name__
+        #         classes[full_class_name].add(trace)
+
+    klass_to_prop_types: Dict[str, List[Dict[str, type]]] = collections.defaultdict(list)
+    for class_trace in class_traces:
+        full_class_name = class_trace.module + '.' + class_trace.qualname
+
+        public_props = extract_public_properties(class_trace.class_props)
+        if public_props:
+            klass_to_prop_types[full_class_name].append(public_props)
+
+    processed_klass_to_prop_types: Dict[str, Dict[str, type]] = {}
+    for classname, prop_sets in klass_to_prop_types.items():
+        prop_types = collections.defaultdict(set)
+        for props in prop_sets:
+            for arg, typ in props.items():
+                prop_types[arg].add(typ)
+
+        prop_types = {name: rewriter.rewrite(shrink_types(ts)) for name, ts in prop_types.items()}
+        processed_klass_to_prop_types[classname] = prop_types
+
+    defns = []
+    for func, traces in index.items():
+        defn = get_updated_definition(func, traces, rewriter, ignore_existing_annotations)
+        # if has_unparsable_defaults(defn.signature) and not include_unparsable_defaults:
+        #     logger.warning(
+        #         "Omitting stub for function %s.%s; it contains unparsable default values." +
+        #         " Re-run with --include-unparsable-defaults to include it.",
+        #         func.__module__, func.__qualname__)
+        # else:
+
+        parameters = {}
+        for name, parameter in defn.signature.parameters.items():
+            # if parameter.annotation is None or parameter.annotation is type(None):
+            #     parameter = parameter.replace(annotation=Union[None, object])
+
+            if parameter.default != inspect.Parameter.empty:
+                parameter = parameter.replace(default=...)
+
+            parameters[name] = parameter
+
+        defn.signature = defn.signature.replace(parameters=parameters.values())
+        defns.append(defn)
+
+    mod_stubs = build_module_stubs(defns, processed_klass_to_prop_types)
+    return mod_stubs
+
+
+
+class StubIndexBuilder(CallTraceLogger):
+    """Builds type stub index directly from collected call traces."""
+
+    def __init__(self, module_re: str) -> None:
+        self.re = re.compile(module_re)
+        self.index: DefaultDict[Callable, Set[CallTrace]] = collections.defaultdict(set)
+
+    def log(self, trace: CallTrace) -> None:
+        if not self.re.match(trace.funcname):
+            return
+        self.index[trace.func].add(trace)
+
+    def get_stubs(self) -> Dict[str, ModuleStub]:
+        defs = (get_updated_definition(func, traces) for func, traces in self.index.items())
+        return build_module_stubs(defs)
