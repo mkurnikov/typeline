@@ -1,3 +1,4 @@
 django_stubs_root/
 .idea/
 pytest-monkeytype/
+__pycache__

@@ -171,7 +171,7 @@ class PostgresStore(CallTraceStore):
             self,
             module: str,
             limit: int = 2000
-    ) -> List[CallTraceThunk]:
+    ) -> List[CallTraceRow]:
         filter_query, params = make_filter_query(module)
         with self.conn.cursor() as cursor:
             cursor.execute(filter_query, tuple(params))

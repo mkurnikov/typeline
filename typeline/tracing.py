@@ -25,7 +25,7 @@ from typing import (
     Optional,
     Union,
     cast,
-    TYPE_CHECKING)
+    TYPE_CHECKING, List)
 
 if TYPE_CHECKING:
     from typeline.postgres.config import PostgresConfig
@@ -242,7 +242,8 @@ class CallTracer:
             code_filter: Optional[CodeFilter] = None,
             sample_rate: Optional[int] = None,
             skip_private_methods: bool = True,
-            skip_private_properties: bool = True
+            skip_private_properties: bool = True,
+            acceptable_modules: Optional[List[str]] = None
     ) -> None:
         self.logger = logger
         self.class_logger = class_logger
@@ -250,6 +251,8 @@ class CallTracer:
         self.sample_rate = sample_rate
         self.cache: Dict[CodeType, Optional[Callable]] = {}
         self.should_trace = code_filter
+
+        self.mro_replacements: Dict[type, type] = {}
 
         # self.class_traces: Dict[str, List[ClassPropsTrace]] = defaultdict(list)
         # self.self_params: Dict[FrameType, Dict[str, Any]] = {}

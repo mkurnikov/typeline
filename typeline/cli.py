@@ -5,16 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 import argparse
 import collections
-import difflib
-import importlib
-import inspect
 import os
 import os.path
 import runpy
-import subprocess
 import sys
-import tempfile
-
 from typing import (
     IO,
     List,
@@ -60,14 +54,6 @@ def module_path_with_qualname(path: str) -> Tuple[str, str]:
     if qualname is None:
         raise argparse.ArgumentTypeError('must be of the form <module>:<qualname>')
     return module, qualname
-
-
-def complain_about_no_traces(args: argparse.Namespace, stderr: IO) -> None:
-    module, qualname = args.module_path
-    if qualname:
-        print(f'No traces found for specifier {module}:{qualname}', file=stderr)
-    else:
-        print(f'No traces found for module {module}', file=stderr)
 
 
 def monkeytype_config(path: str) -> Config:
@@ -126,7 +112,7 @@ def generate_stub_for_module(config: PostgresConfig,
                              module: str,
                              suppress_errors=False,
                              stderr=None) -> Optional[Stub]:
-    call_thunks = config.trace_store().filter(module)[:500]
+    call_thunks = config.trace_store().filter(module)
     traces = []
     for thunk in call_thunks:
         try:
@@ -139,17 +125,12 @@ def generate_stub_for_module(config: PostgresConfig,
             except MonkeyTypeError:
                 if not suppress_errors:
                     raise
-            # except Exception:
-            #     if suppress_errors:
-            #         continue
-            #     else:
-            #         raise
 
         except MonkeyTypeError as mte:
             print(f'ERROR: Failed decoding trace: {mte}', file=stderr or sys.stderr)
 
     class_traces = []
-    class_thunks = config.trace_store().extract_class_props(module)[:500]
+    class_thunks = config.trace_store().extract_class_props(module)
     for thunk in class_thunks:
         try:
             class_trace = thunk.to_trace()
@@ -171,79 +152,6 @@ def generate_stub_for_module(config: PostgresConfig,
 
 class HandlerError(Exception):
     pass
-
-
-def apply_stub_handler(args: argparse.Namespace, stdout: IO, stderr: IO) -> None:
-    args.ignore_existing_annotations = False
-    stub = get_stub(args, stdout, stderr)
-    if stub is None:
-        complain_about_no_traces(args, stderr)
-        return
-    module = args.module_path[0]
-    mod = importlib.import_module(module)
-    src_path = inspect.getfile(mod)
-    src_dir = os.path.dirname(src_path)
-
-    with tempfile.TemporaryDirectory(prefix='monkeytype') as pyi_dir:
-        if src_path.endswith('__init__.py'):
-            pyi_name = '__init__.pyi'
-        else:
-            pyi_name = module.split('.')[-1] + '.pyi'
-        pyi_path = os.path.join(pyi_dir, pyi_name)
-        with open(pyi_path, 'w+') as f:
-            f.write(stub.render())
-        retype_args = [
-            'retype',
-            '--pyi-dir', pyi_dir,
-            '--target-dir', src_dir,
-            src_path
-        ]
-        try:
-            proc = subprocess.run(retype_args, check=True, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
-            print(proc.stdout.decode('utf-8'), file=stdout)
-        except subprocess.CalledProcessError as cpe:
-            raise HandlerError(f"Failed applying stub with retype:\n{cpe.stdout.decode('utf-8')}")
-
-
-def get_diff(args: argparse.Namespace, stdout: IO, stderr: IO) -> Optional[str]:
-    args.ignore_existing_annotations = False
-    stub = get_stub(args, stdout, stderr)
-    args.ignore_existing_annotations = True
-    stub_ignore_anno = get_stub(args, stdout, stderr)
-    if stub is None or stub_ignore_anno is None:
-        return None
-    diff = []
-    seq1 = (s + "\n" for s in stub.render().split("\n\n\n"))
-    seq2 = (s + "\n" for s in stub_ignore_anno.render().split("\n\n\n"))
-    for stub1, stub2 in zip(seq1, seq2):
-        if stub1 != stub2:
-            stub_diff = "".join(difflib.ndiff(stub1.splitlines(keepends=True), stub2.splitlines(keepends=True)))
-            diff.append(stub_diff[:-1])
-    return "\n\n\n".join(diff)
-
-
-def print_stub_handler(args: argparse.Namespace, stdout: IO, stderr: IO) -> None:
-    output, file = None, stdout
-    if args.diff:
-        output = get_diff(args, stdout, stderr)
-    else:
-        stub = get_stub(args, stdout, stderr)
-        if stub is not None:
-            output = stub.render()
-    if output is None:
-        complain_about_no_traces(args, stderr)
-        return
-    print(output, file=file)
-
-
-def list_modules_handler(args: argparse.Namespace, stdout: IO, stderr: IO) -> None:
-    output, file = None, stdout
-    modules = args.config.trace_store().list_modules()
-    if not modules:
-        complain_about_no_traces(args, stderr)
-        return
-    output = '\n'.join(modules)
-    print(output, file=file)
 
 
 def run_handler(args: argparse.Namespace, stdout: IO, stderr: IO) -> None:
@@ -353,7 +261,7 @@ qualname format.""")
         action='store_true',
         default=False,
         help='Print to stderr the numbers of traces stubs are based on'
-        )
+    )
     apply_parser.set_defaults(handler=apply_stub_handler)
 
     stub_parser = subparsers.add_parser(
@@ -375,19 +283,19 @@ qualname format.""")
         action='store_true',
         default=False,
         help='Print to stderr the numbers of traces stubs are based on'
-        )
+    )
     stub_parser.add_argument(
         "--ignore-existing-annotations",
         action='store_true',
         default=False,
         help='Ignore existing annotations and generate stubs only from traces.',
-        )
+    )
     stub_parser.add_argument(
         "--diff",
         action='store_true',
         default=False,
         help='Compare stubs generated with and without considering existing annotations.',
-        )
+    )
     stub_parser.set_defaults(handler=print_stub_handler)
 
     list_modules_parser = subparsers.add_parser(
