@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """Re-apply type annotations from .pyi stubs to your codebase."""
-
-from functools import partial, singledispatch
-from lib2to3 import pygram, pytree
-from lib2to3.pgen2 import driver
-from lib2to3.pgen2 import token
-from lib2to3.pgen2.parse import ParseError
-from lib2to3.pygram import python_symbols as syms
-from lib2to3.pytree import Node, Leaf, type_repr
-from pathlib import Path
 import re
 import sys
 import threading
 import tokenize
 import traceback
+from functools import partial, singledispatch
+from lib2to3 import pygram, pytree, fixer_util
+from lib2to3.pgen2 import driver, token
+from lib2to3.pgen2.parse import ParseError
+from lib2to3.pygram import python_symbols as syms
+from lib2to3.pytree import Node, Leaf
+from pathlib import Path
+from typing import Tuple, List
 
+import _ast3
 import click
 from typed_ast import ast3
 
@@ -28,7 +28,6 @@ Directory = partial(
     readable=True,
     writable=False,
 )
-
 
 Config = threading.local()
 
@@ -91,12 +90,12 @@ def main(src, pyi_dir, target_dir, incremental, quiet, replace_any, hg, tracebac
     returncode = 0
     for src_entry in src:
         for file, error, exc_type, tb in retype_path(
-            Path(src_entry),
-            pyi_dir=Path(pyi_dir),
-            targets=Path(target_dir),
-            src_explicitly_given=True,
-            quiet=quiet,
-            hg=hg,
+                Path(src_entry),
+                pyi_dir=Path(pyi_dir),
+                targets=Path(target_dir),
+                src_explicitly_given=True,
+                quiet=quiet,
+                hg=hg,
         ):
             print(f'error: {file}: {error}', file=sys.stderr)
             if traceback:
@@ -114,7 +113,7 @@ def main(src, pyi_dir, target_dir, incremental, quiet, replace_any, hg, tracebac
 
 
 def retype_path(
-    src, pyi_dir, targets, *, src_explicitly_given=False, quiet=False, hg=False
+        src, pyi_dir, targets, *, src_explicitly_given=False, quiet=False, hg=False
 ):
     """Recursively retype files or directories given. Generate errors."""
     if src.is_dir():
@@ -223,7 +222,7 @@ def reapply(ast_node, lib2to3_node):
 
 
 @reapply.register(list)
-def _r_list(l, lib2to3_node):
+def _r_list(l: list, lib2to3_node: Node):
     if lib2to3_node.type not in (syms.file_input, syms.suite):
         return []
 
@@ -276,8 +275,9 @@ def _r_import(import_, node):
 
 
 @reapply.register(ast3.ClassDef)
-def _r_classdef(cls, node):
+def _r_classdef(cls: ast3.ClassDef, node: Node):
     assert node.type in (syms.file_input, syms.suite)
+
     name = Leaf(token.NAME, cls.name)
     for child in flatten_some(node.children):
         if child.type == syms.decorated:
@@ -296,38 +296,102 @@ def _r_classdef(cls, node):
     return result
 
 
+def indent(level) -> List[Leaf]:
+    return [Leaf(token.INDENT, '    ') for i in range(level)]
+
+
+def ellipsis() -> Node:
+    return Node(syms.atom, [
+        fixer_util.Dot(),
+        fixer_util.Dot(),
+        fixer_util.Dot()
+    ])
+
+
+def parameters(arg_names: List[str]) -> Node:
+    # children = [Leaf(token.LPAR, '(')]
+    children = []
+    for name in arg_names:
+        prefix = ''
+        if children and children[-1].type == token.COMMA and children[-2].type == token.NAME:
+            prefix = ' '
+
+        children.extend([Leaf(token.NAME, name, prefix=prefix),
+                         Leaf(token.COMMA, ',')])
+
+    return Node(syms.parameters, [
+        Leaf(token.LPAR, '('),
+        Node(syms.typedargslist, children),
+        Leaf(token.RPAR, ')')
+    ])
+
+
+def get_funcdef_node(funcname: str, args: List[str], decorators: List[str], indentation_level=1) -> Node:
+    to_prepend = []
+    for decorator in decorators:
+        decorator_node = Node(syms.decorator, [
+            Leaf(token.INDENT, '    ' * indentation_level),
+            Leaf(token.AT, '@'),
+            Leaf(token.NAME, decorator),
+            fixer_util.Newline()
+        ])
+        to_prepend.append(decorator_node)
+
+    return Node(
+        syms.suite, [
+            fixer_util.Newline(),
+            *to_prepend,
+            Leaf(token.INDENT, '    ' * indentation_level),
+            Node(syms.funcdef, [
+                Leaf(token.NAME, 'def'),
+                Leaf(token.NAME, funcname, prefix=' '),
+                parameters(args),
+                # Leaf(token.RARROW, '->', prefix=' '),
+                # Leaf(token.NAME, return_type, prefix=' '),
+                Leaf(token.COLON, ':'),
+                Node(syms.suite, [
+                    fixer_util.Newline(),
+                    *indent(indentation_level + 1),
+                    ellipsis(),
+                    fixer_util.Newline()
+                ])
+            ])
+        ])
+
+
 @reapply.register(ast3.AsyncFunctionDef)
 @reapply.register(ast3.FunctionDef)
-def _r_functiondef(fun, node):
-    assert node.type in (syms.file_input, syms.suite)
-    name = Leaf(token.NAME, fun.name)
-    pyi_decorators = decorator_names(fun.decorator_list)
-    pyi_method_decorators = list( \
+def _r_functiondef(pyi_fun: ast3.FunctionDef, py_node: Node):
+    assert py_node.type in (syms.file_input, syms.suite)
+
+    name = Leaf(token.NAME, pyi_fun.name)
+    pyi_decorators = decorator_names(pyi_fun.decorator_list)
+    pyi_method_decorators = list(
         filter(is_builtin_method_decorator, pyi_decorators)
     ) or ['instancemethod']
     is_method = (
-        node.parent is not None and \
-        node.parent.type == syms.classdef and
-        "staticmethod" not in pyi_method_decorators
+            py_node.parent is not None and
+            py_node.parent.type == syms.classdef and
+            "staticmethod" not in pyi_method_decorators
     )
-    args, returns = get_function_signature(fun, is_method=is_method)
-    for child in flatten_some(node.children):
+    pyi_func_args, pyi_func_returns = get_function_signature(pyi_fun, is_method=is_method)
+    for child_idx, py_child in enumerate(flatten_some(py_node.children)):
         decorators = None
-        if child.type == syms.decorated:
+        if py_child.type == syms.decorated:
             # skip decorators
-            decorators = child.children[0]
-            child = child.children[1]
+            decorators = py_child.children[0]
+            py_child = py_child.children[1]
 
-        if child.type in (syms.async_stmt, syms.async_funcdef):
+        if py_child.type in (syms.async_stmt, syms.async_funcdef):
             # async def in 3.5 and 3.6
-            child = child.children[1]
+            py_child = py_child.children[1]
 
-        if child.type != syms.funcdef:
+        if py_child.type != syms.funcdef:
             continue
 
         offset = 1
-        if child.children[offset] == name:
-            lineno = child.get_lineno()
+        if py_child.children[offset] == name:
+            lineno = py_child.get_lineno()
             column = 1
 
             if decorators:
@@ -337,7 +401,7 @@ def _r_functiondef(fun, node):
                 ) or ['instancemethod']
                 if pyi_method_decorators != src_method_decorators:
                     raise ValueError(
-                        f"Incompatible method kind for {fun.name!r}: " +
+                        f"Incompatible method kind for {pyi_fun.name!r}: " +
                         f"{lineno}:{column}: Expected: " +
                         f"{pyi_method_decorators[0]}, actual: " +
                         f"{src_method_decorators[0]}"
@@ -347,11 +411,11 @@ def _r_functiondef(fun, node):
 
             try:
                 annotate_parameters(
-                    child.children[offset + 1], args, is_method=is_method
+                    py_child.children[offset + 1], pyi_func_args, is_method=is_method
                 )
-                annotate_return(child.children, returns, offset + 2)
-                reapply(fun.body, child.children[-1])
-                remove_function_signature_type_comment(child.children[-1])
+                annotate_return(py_child.children, pyi_func_returns, offset + 2)
+                reapply(pyi_fun.body, py_child.children[-1])
+                remove_function_signature_type_comment(py_child.children[-1])
             except ValueError as ve:
                 raise ValueError(
                     f"Annotation problem in function {name.value!r}: " +
@@ -360,7 +424,16 @@ def _r_functiondef(fun, node):
                 # return node
             break
     else:
-        # raise ValueError(f"Function {name.value!r} not found in source.")
+        is_method = 'staticmethod' not in pyi_decorators
+
+        py_node.children.insert(child_idx,
+                                get_funcdef_node(pyi_fun.name, [arg.arg for arg in pyi_func_args.args],
+                                                 decorators=pyi_decorators))
+        py_func = py_node.children[child_idx].children[offset + len(pyi_decorators) + 1]
+        annotate_parameters(
+            py_func.children[offset + 1], pyi_func_args, is_method=is_method)
+        annotate_return(py_func.children, pyi_func_returns, offset + 2)
+
         return []
 
     return []
@@ -398,8 +471,8 @@ def _r_annassign(annassign, body):
         expr = maybe_expr.children
 
         if (
-            expr[0].type in (token.NAME, syms.power) and
-            minimize_whitespace(str(expr[0])) == name
+                expr[0].type in (token.NAME, syms.power) and
+                minimize_whitespace(str(expr[0])) == name
         ):
             if expr[1].type == syms.annassign:
                 # variable already typed, let's just ensure it's sane
@@ -511,10 +584,10 @@ def _r_assign(assign, body):
         expr = maybe_expr.children
 
         if (
-            isinstance(expr[0], Leaf) and
-            expr[0].type == token.NAME and
-            expr[0].value == name and
-            expr[1] == _eq
+                isinstance(expr[0], Leaf) and
+                expr[0].type == token.NAME and
+                expr[0].value == name and
+                expr[1] == _eq
         ):
             expr[2] = maybe_replace_any_if_equal(f"alias {name!r}", value, expr[2])
             break
@@ -593,13 +666,13 @@ def _c_subscript(sub):
         syms.power,
         [
             convert_annotation(sub.value), Node(
-                syms.trailer,
-                [
-                    new(_lsqb),
-                    convert_annotation(sub.slice),
-                    new(_rsqb),
-                ],
-            )
+            syms.trailer,
+            [
+                new(_lsqb),
+                convert_annotation(sub.slice),
+                new(_rsqb),
+            ],
+        )
         ],
     )
 
@@ -751,7 +824,7 @@ def decorator_names(obj):
 
 
 @decorator_names.register(Node)
-def _dn_node(node):
+def _dn_node(node: Node):
     if node.type == syms.decorator:
         return [str(node.children[1])]
 
@@ -762,7 +835,7 @@ def _dn_node(node):
 
 
 @decorator_names.register(list)
-def _dn_list(l):
+def _dn_list(l: list):
     result = []
     for elem in l:
         result.extend(decorator_names(elem))
@@ -770,7 +843,7 @@ def _dn_list(l):
 
 
 @decorator_names.register(ast3.Name)
-def _dn_name(name):
+def _dn_name(name: ast3.Name):
     return [name.id]
 
 
@@ -903,7 +976,7 @@ def append_after_imports(stmt_to_insert, node):
     node.children.insert(offset, stmt_to_insert)
 
 
-def annotate_parameters(parameters, ast_args, *, is_method=False):
+def annotate_parameters(parameters: Node, ast_args: _ast3.arguments, *, is_method=False):
     params = parameters.children[1:-1]
     if len(params) == 0:
         return  # FIXME: handle checking if the expected (AST) function is also empty.
@@ -1050,7 +1123,7 @@ def annotate_return(function, ast_returns, offset):
         raise NotImplementedError(f"unexpected return token: {str(function[offset])!r}")
 
 
-def get_function_signature(fun, *, is_method=False):
+def get_function_signature(fun, *, is_method=False) -> Tuple[_ast3.arguments, ast3.Name]:
     """Returns (args, returns).
 
     `args` is ast3.arguments, `returns` is the return type AST node. The kicker
@@ -1320,7 +1393,7 @@ def pop_param(params):
 
 
 def gen_annotated_params(
-    args, defaults, params, *, implicit_default=False, is_method=False
+        args, defaults, params, *, implicit_default=False, is_method=False
 ):
     missing_ok = is_method or Config.incremental
     for arg, expected_default in zip(args, defaults):
@@ -1419,10 +1492,10 @@ def get_offset_and_prefix(body, skip_assignments=False):
                     break
 
                 if (
-                    len(expr) != 2 or
-                    expr[0].type != token.NAME or
-                    expr[1].type != syms.annassign or
-                    _eq in expr[1].children
+                        len(expr) != 2 or
+                        expr[0].type != token.NAME or
+                        expr[1].type != syms.annassign or
+                        _eq in expr[1].children
                 ):
                     break
 
