@@ -176,7 +176,7 @@ def lib2to3_parse(src_txt):
         nl = '\r\n' if '\r\n' in src_txt[:1024] else '\n'
         src_txt += nl
     try:
-        result = drv.parse_string(src_txt, True)
+        result = drv.parse_string(src_txt, False)
     except ParseError as pe:
         lineno, column = pe.context[1]
         lines = src_txt.splitlines()
