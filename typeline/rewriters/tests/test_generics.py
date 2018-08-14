@@ -3,17 +3,23 @@ from typing import Union, Any, List, Dict, Set, Tuple, Type, Iterator
 from unittest import TestCase
 
 from django.http.multipartparser import LazyStream
+
+from typeline.rewriters.generics import RemoveEmptyContainersRewriter
 from typeline.rewriters.transformers import DepthFirstTypeTraverser, TwoElementUnionRewriter, simplify_types, \
     simplify_int_float, find_acceptable_common_base, remove_empty_container, simplify_generics, SimplifyGenerics, \
     FindAcceptableCommonBase
 from typeline.typing import TypeRewriter
+
+from unittest import util as unittest_util
+unittest_util._MAX_LENGTH = 300
 
 
 class BaseRewriterTestCase(TestCase):
     rewriter: TypeRewriter
 
     def assertRewrittenEqual(self, original, goal):
-        self.assertEqual(self.rewriter.rewrite(original), goal)
+        rewritten = self.rewriter.rewrite(original)
+        self.assertEqual(rewritten, goal)
 
 
 class TestRemoveEmptyContainers(BaseRewriterTestCase):

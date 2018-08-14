@@ -425,7 +425,13 @@ def _r_functiondef(pyi_fun: ast3.FunctionDef, py_node: Node):
             break
     else:
         is_method = 'staticmethod' not in pyi_decorators
+        if name.value in {'__str__', '__repr__', '__getstate__', '__setstate__'}:
+            return []
 
+        if py_node.parent is None:
+            return []
+
+        print('inserting function', name.value)
         py_node.children.insert(child_idx,
                                 get_funcdef_node(pyi_fun.name, [arg.arg for arg in pyi_func_args.args],
                                                  decorators=pyi_decorators))
@@ -441,6 +447,9 @@ def _r_functiondef(pyi_fun: ast3.FunctionDef, py_node: Node):
 
 @reapply.register(ast3.AnnAssign)
 def _r_annassign(annassign, body):
+    if body.type not in (syms.file_input, syms.suite):
+        return []
+
     assert body.type in (syms.file_input, syms.suite)
 
     target = annassign.target

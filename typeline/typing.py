@@ -227,15 +227,16 @@ def safe_getmro(t):
 class RewriteLargeUnion(TypeRewriter):
     """Rewrite Union[T1, ..., TN] as Any for large N."""
 
-    def __init__(self, max_union_len: int = 5):
+    def __init__(self, max_unique_types=5, max_members=8):
         super().__init__()
-        self.max_union_len = max_union_len
+        self.max_unique_types = max_unique_types
+        self.max_members = max_members
 
     def _rewrite_to_tuple(self, union):
         """Union[Tuple[V, ..., V], Tuple[V, ..., V], ...] -> Tuple[V, ...]"""
         value_type = None
         for t in union.__args__:
-            if not hasattr(t, '__args__') or not issubclass(t, Tuple):
+            if not hasattr(t, '__args__') or t.__args__ is None or not issubclass(t, Tuple):
                 return None
             value_type = value_type or t.__args__[0]
             if not all(vt is value_type for vt in t.__args__):
@@ -243,23 +244,41 @@ class RewriteLargeUnion(TypeRewriter):
         return Tuple[value_type, ...]
 
     def rewrite_Union(self, union):
-        if len(union.__args__) <= self.max_union_len:
+        if not isinstance(union, _Union):
+            return union
+
+        if len(union.__args__) <= self.max_unique_types:
             return union
 
         rw_union = self._rewrite_to_tuple(union)
         if rw_union is not None:
             return rw_union
 
-        try:
-            for ancestor in safe_getmro(union.__args__[0]):
-                if (
-                        ancestor is not object and
-                        all(safe_issubclass(t, ancestor) for t in union.__args__)
-                ):
-                    return ancestor
-        except TypeError:
-            pass
-        return Any
+        unique_classes = set()
+        for arg_class in union.__args__:
+            if hasattr(arg_class, '_gorg'):
+                unique_classes.add(arg_class._gorg)
+                continue
+
+            unique_classes.add(arg_class)
+
+        if len(unique_classes) > self.max_unique_types:
+            return Any
+
+        if len(union.__args__) > self.max_members:
+            return Any
+
+        return union
+        # try:
+        #     for ancestor in safe_getmro(union.__args__[0]):
+        #         if (
+        #                 ancestor is not object and
+        #                 all(safe_issubclass(t, ancestor) for t in union.__args__)
+        #         ):
+        #             return ancestor
+        # except TypeError:
+        #     pass
+        # return Any
 
 
 class ChainedRewriter(TypeRewriter):

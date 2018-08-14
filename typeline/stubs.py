@@ -350,9 +350,15 @@ def _get_optional_elem(anno: Any) -> Any:
     return Union[elems]
 
 
+def render_union(anno: _Union) -> str:
+    rendered_args = sorted([render_annotation(arg) for arg in anno.__args__ or []])
+    return 'Union[' + ', '.join(rendered_args) + ']'
+
+
 def render_generic(anno) -> str:
     cls_name = anno.__name__
     rendered_args = [render_annotation(arg) for arg in anno.__args__ or []]
+
     if not rendered_args:
         return cls_name
 
@@ -373,6 +379,8 @@ def render_annotation(anno: Any) -> str:
         rendered = 'Optional[' + render_annotation(elem_type) + ']'
     elif hasattr(anno, '_gorg'):
         rendered = render_generic(anno)
+    elif isinstance(anno, _Union):
+        rendered = render_union(anno)
     elif hasattr(anno, '__supertype__'):
         rendered = anno.__name__
     elif getattr(anno, '__module__', None) == 'typing':

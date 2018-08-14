@@ -7,6 +7,8 @@ import importlib
 import inspect
 import types
 
+from django.template import TemplateDoesNotExist
+
 try:
     from django.utils.functional import cached_property  # type: ignore
 except ImportError:

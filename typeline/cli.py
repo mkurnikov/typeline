@@ -111,8 +111,11 @@ def get_stub(args: argparse.Namespace, stdout: IO, stderr: IO) -> Optional[Stub]
 def generate_stub_for_module(config: PostgresConfig,
                              module: str,
                              suppress_errors=False,
-                             stderr=None) -> Optional[Stub]:
-    call_thunks = config.trace_store().filter(module)
+                             stderr=None,
+                             limit_rows=300,
+                             suppressed_exceptions=None) -> Optional[Stub]:
+    suppressed_exceptions = (suppressed_exceptions or []) + [MonkeyTypeError]
+    call_thunks = config.trace_store().filter(module)[:limit_rows]
     traces = []
     for thunk in call_thunks:
         try:
@@ -122,7 +125,7 @@ def generate_stub_for_module(config: PostgresConfig,
 
                 trace = thunk.to_trace()
                 traces.append(trace)
-            except MonkeyTypeError:
+            except tuple(suppressed_exceptions):
                 if not suppress_errors:
                     raise
 
@@ -130,7 +133,7 @@ def generate_stub_for_module(config: PostgresConfig,
             print(f'ERROR: Failed decoding trace: {mte}', file=stderr or sys.stderr)
 
     class_traces = []
-    class_thunks = config.trace_store().extract_class_props(module)
+    class_thunks = config.trace_store().extract_class_props(module)[:limit_rows]
     for thunk in class_thunks:
         try:
             class_trace = thunk.to_trace()

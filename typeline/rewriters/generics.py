@@ -223,7 +223,7 @@ class SimplifyUnionOfTypes(UnionRewriter):
         return Type[make_union(list(obj1.__args__) + list(obj2.__args__))]
 
 
-class DepthFirstTypeTraverser(TypeRewriter):
+class _DepthFirstTypeTraverser(TypeRewriter):
     def __init__(self, union_rewriter: TypeRewriter):
         self.union_rewriter = union_rewriter
 
